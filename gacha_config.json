@@ -1,0 +1,35 @@
+{
+  "gacha_region": [
+    628,
+    490,
+    1708,
+    934
+  ],
+  "draw_button_region": [
+    1540,
+    1095,
+    1713,
+    1145
+  ],
+  "confirm_button_region": [
+    1185,
+    811,
+    1306,
+    840
+  ],
+  "skip_button_region": [
+    1870,
+    246,
+    1935,
+    292
+  ],
+  "target_count": 4,
+  "countdown": 3,
+  "delay_draw": 0.8,
+  "delay_confirm": 0.4,
+  "skip_gap": 0.4,
+  "delay_after_skip": 1.8,
+  "jitter": 0.0,
+  "sat_threshold": 40,
+  "val_threshold": 100
+}

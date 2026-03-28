@@ -315,46 +315,167 @@ class AutoGachaApp:
         img = np.array(img)
         return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
+    # def count_rainbow_cards(self, img_bgr, debug=False):
+    #     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+
+    #     lower = np.array([0, self.sat_var.get(), self.val_var.get()], dtype=np.uint8)
+    #     upper = np.array([179, 255, 255], dtype=np.uint8)
+    #     mask = cv2.inRange(hsv, lower, upper)
+
+    #     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 25))
+    #     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    #     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1)
+
+    #     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    #     count = 0
+    #     boxes = []
+    #     h, w = img_bgr.shape[:2]
+
+    #     for cnt in contours:
+    #         x, y, bw, bh = cv2.boundingRect(cnt)
+    #         area = bw * bh
+
+    #         if bh < max(80, int(h * 0.30)):
+    #             continue
+    #         if bw < max(25, int(w * 0.03)):
+    #             continue
+    #         if area < 3500:
+    #             continue
+
+    #         ratio = bh / max(bw, 1)
+    #         if ratio < 1.5:
+    #             continue
+
+    #         count += 1
+    #         boxes.append((x, y, bw, bh))
+
+    #     debug_img = img_bgr.copy()
+    #     for x, y, bw, bh in boxes:
+    #         cv2.rectangle(debug_img, (x, y), (x + bw, y + bh), (0, 255, 0), 3)
+
+    #     return count, mask, debug_img
+    
     def count_rainbow_cards(self, img_bgr, debug=False):
+        """
+        更稳的 rainbow 检测：
+        1) 先用 HSV 找高饱和/较亮区域
+        2) 只保留“高而窄”的连通区域
+        3) 再检查该区域是否具有足够丰富的 hue（彩虹，而不是单色衣服）
+        4) 最后按 x 方向合并相邻区域，避免同一张 rainbow 卡被算成多个
+        """
         hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+        H, S, V = cv2.split(hsv)
 
-        lower = np.array([0, self.sat_var.get(), self.val_var.get()], dtype=np.uint8)
-        upper = np.array([179, 255, 255], dtype=np.uint8)
-        mask = cv2.inRange(hsv, lower, upper)
+        # 先做较宽松的阈值，不要太苛刻
+        sat_thr = self.sat_var.get()      # 比如 60~80
+        val_thr = self.val_var.get()      # 比如 110~140
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 25))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1)
+        mask = ((S >= sat_thr) & (V >= val_thr)).astype(np.uint8) * 255
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # 去掉太小的噪声
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 15))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=1)
 
-        count = 0
-        boxes = []
-        h, w = img_bgr.shape[:2]
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
 
-        for cnt in contours:
-            x, y, bw, bh = cv2.boundingRect(cnt)
-            area = bw * bh
-
-            if bh < max(80, int(h * 0.30)):
-                continue
-            if bw < max(25, int(w * 0.03)):
-                continue
-            if area < 3500:
-                continue
-
-            ratio = bh / max(bw, 1)
-            if ratio < 1.5:
-                continue
-
-            count += 1
-            boxes.append((x, y, bw, bh))
+        h_img, w_img = img_bgr.shape[:2]
+        candidate_boxes = []
 
         debug_img = img_bgr.copy()
-        for x, y, bw, bh in boxes:
-            cv2.rectangle(debug_img, (x, y), (x + bw, y + bh), (0, 255, 0), 3)
 
-        return count, mask, debug_img
+        for label_id in range(1, num_labels):
+            x = stats[label_id, cv2.CC_STAT_LEFT]
+            y = stats[label_id, cv2.CC_STAT_TOP]
+            w = stats[label_id, cv2.CC_STAT_WIDTH]
+            h = stats[label_id, cv2.CC_STAT_HEIGHT]
+            area = stats[label_id, cv2.CC_STAT_AREA]
+
+            # ---- 第一步：几何过滤 ----
+            # rainbow 边框通常“高而窄”
+            if h < int(h_img * 0.45):
+                continue
+            if w < max(12, int(w_img * 0.01)):
+                continue
+            if w > int(w_img * 0.12):
+                continue
+            if area < 1200:
+                continue
+
+            aspect = h / max(w, 1)
+            if aspect < 2.2:
+                continue
+
+            # ---- 第二步：区域内部的“竖向覆盖率” ----
+            # 如果只是衣服/头发的一团颜色，通常不会在很多行里持续出现
+            comp_mask = (labels[y:y+h, x:x+w] == label_id).astype(np.uint8)
+            row_coverage = comp_mask.sum(axis=1) / max(w, 1)
+
+            # 有多少行在该连通块里至少覆盖了 25% 宽度
+            strong_rows = np.sum(row_coverage > 0.25)
+            if strong_rows < int(h * 0.55):
+                continue
+
+            # ---- 第三步：颜色多样性 ----
+            # rainbow 的 hue 分布会更分散；角色衣服/头发通常 hue 比较集中
+            h_patch = H[y:y+h, x:x+w]
+            s_patch = S[y:y+h, x:x+w]
+            v_patch = V[y:y+h, x:x+w]
+
+            valid = (comp_mask > 0) & (s_patch >= sat_thr) & (v_patch >= val_thr)
+            hue_vals = h_patch[valid]
+
+            if len(hue_vals) < 200:
+                continue
+
+            # 统计 hue 直方图（OpenCV hue: 0~179）
+            hist, _ = np.histogram(hue_vals, bins=12, range=(0, 180))
+
+            # 至少有几个 bin 明显非零，代表颜色不止一种
+            active_bins = np.sum(hist > max(20, len(hue_vals) * 0.03))
+            if active_bins < 4:
+                continue
+
+            # 标准差也辅助判断
+            hue_std = np.std(hue_vals.astype(np.float32))
+            if hue_std < 18:
+                continue
+
+            candidate_boxes.append((x, y, w, h))
+
+        # ---- 第四步：按 x 方向合并相近候选，避免同一张卡被拆成多个竖条 ----
+        candidate_boxes = sorted(candidate_boxes, key=lambda b: b[0])
+
+        merged = []
+        for box in candidate_boxes:
+            x, y, w, h = box
+            if not merged:
+                merged.append([x, y, x+w, y+h])
+                continue
+
+            px1, py1, px2, py2 = merged[-1]
+
+            # 如果两个候选在 x 方向很近，就合并
+            # 这可以避免同一张 rainbow 卡左右两个彩边被当两张
+            if x - px2 < max(25, int(w_img * 0.03)):
+                merged[-1] = [
+                    min(px1, x),
+                    min(py1, y),
+                    max(px2, x+w),
+                    max(py2, y+h),
+                ]
+            else:
+                merged.append([x, y, x+w, y+h])
+
+        final_boxes = []
+        for x1, y1, x2, y2 in merged:
+            final_boxes.append((x1, y1, x2-x1, y2-y1))
+            if debug:
+                cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 255, 0), 3)
+
+        return len(final_boxes), mask, debug_img
 
     def show_preview(self, img_bgr):
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
